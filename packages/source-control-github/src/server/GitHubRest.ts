@@ -119,6 +119,7 @@ export const make = Effect.gen(function* () {
   const send = Effect.fn("GitHubRest.send")(function* (input: {
     readonly host: string;
     readonly operation: string;
+    readonly repository: string | undefined;
     readonly request: HttpClientRequest.HttpClientRequest;
     readonly maxResponseBytes: number;
     readonly timeout?: Duration.Input | undefined;
@@ -136,6 +137,7 @@ export const make = Effect.gen(function* () {
       {
         host,
         operation: input.operation,
+        repository: input.repository,
         // All current paths spend `core`; search would need a different resource.
         resource: "core",
         allowReserve: input.allowReserve,
@@ -198,6 +200,7 @@ export const make = Effect.gen(function* () {
         send({
           host: input.host,
           operation: input.operation,
+          repository: /^\/?repos\/([^/]+\/[^/?#]+)/.exec(input.path)?.[1],
           request,
           maxResponseBytes: input.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
           timeout: input.timeout,

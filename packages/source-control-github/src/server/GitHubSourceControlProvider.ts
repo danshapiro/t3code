@@ -543,6 +543,7 @@ const contextHost = (context: SourceControlProvider.SourceControlProviderContext
 
 export const make = Effect.gen(function* () {
   const api = yield* GitHubRest.GitHubRest;
+  const policy = yield* GitHubRequestPolicy.GitHubRequestPolicy;
   const sourceControlHost = yield* SourceControlHost.SourceControlHost;
   const process = sourceControlHost.process;
   const environment = yield* HostProcess.Environment;
@@ -617,6 +618,7 @@ export const make = Effect.gen(function* () {
   ) =>
     effect.pipe(
       GitHubGraphQlClient.call(target),
+      GitHubRequestPolicy.withRepositoryCredential(policy.credential, target),
       Effect.mapError((error) =>
         GraphQLClientError.isGraphQLClientError(error)
           ? failure(decodeDetail, error)
@@ -684,6 +686,7 @@ export const make = Effect.gen(function* () {
       {
         host: locator.host,
         operation: "listPullRequestsByHead",
+        repository: `${locator.owner}/${locator.name}`,
         allowReserve: input.allowReserve,
         // 50 default-branch lookups can each match 100 fork PRs and exceed the usual cap.
         maxResponseBytes: HEAD_LOOKUP_MAX_RESPONSE_BYTES,
@@ -736,7 +739,12 @@ export const make = Effect.gen(function* () {
       const locator = parsed.kind === "url" ? parsed.locator : yield* resolveRepository(input);
       const decodeDetail = "GitHub returned an invalid pull request.";
       const result = yield* graphqlRead(
-        { host: locator.host, operation: "getPullRequest", allowReserve: true },
+        {
+          host: locator.host,
+          repository: `${locator.owner}/${locator.name}`,
+          operation: "getPullRequest",
+          allowReserve: true,
+        },
         decodeDetail,
         client.PullRequestByNumber({
           owner: locator.owner,

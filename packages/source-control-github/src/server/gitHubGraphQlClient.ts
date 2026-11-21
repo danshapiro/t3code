@@ -25,6 +25,7 @@ export class GitHubGraphQlTarget extends Context.Service<
   GitHubGraphQlTarget,
   {
     readonly host: string;
+    readonly repository?: string | undefined;
     readonly operation: string;
     /** Overrides `SourceControlRateLimit.Interactive` for this one call. */
     readonly allowReserve?: boolean | undefined;
@@ -90,6 +91,7 @@ export class GitHubGraphQlAuth extends GraphQLMiddleware.Service<
             {
               host,
               operation: target.operation,
+              repository: target.repository,
               resource: "graphql",
               allowReserve: target.allowReserve ?? (yield* SourceControlRateLimit.Interactive),
             },

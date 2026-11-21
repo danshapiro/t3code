@@ -1042,6 +1042,7 @@ const PullRequestGraphQLGroup = GraphQLGroup.merge(
 interface RestReadInput<A> {
   readonly cwd: string;
   readonly host: string;
+  readonly repository?: string;
   readonly operation: string;
   readonly path: string;
   readonly decode: (raw: string) => Result.Result<A, unknown>;
@@ -1174,6 +1175,7 @@ export const make = Effect.gen(function* () {
     (input: {
       readonly cwd: string;
       readonly host: string;
+      readonly repository?: string | undefined;
       readonly operation: string;
       readonly allowReserve?: boolean | undefined;
     }) =>
@@ -1190,6 +1192,7 @@ export const make = Effect.gen(function* () {
       effect.pipe(
         GitHubGraphQlClient.call({
           host: input.host,
+          repository: input.repository,
           operation: input.operation,
           ...(input.allowReserve === true ? { allowReserve: true } : {}),
         }),
@@ -1338,7 +1341,7 @@ export const make = Effect.gen(function* () {
     input: RestReadInput<A>,
   ) {
     const host = normalizeHost(input.host);
-    const { token, fingerprint } = yield* api.credential(host);
+    const { token, fingerprint } = yield* api.credential(host, { repository: input.repository });
     const key = `${fingerprint}\0${host}\0${input.path}`;
     const previous = yield* Cache.get(validators, key);
     const response = yield* api
@@ -1578,7 +1581,7 @@ export const make = Effect.gen(function* () {
       read: (requestedReviewers: number) => Effect.Effect<A, E, R>,
     ) {
       const host = normalizeHost(input.host);
-      const { fingerprint } = yield* api.credential(host);
+      const { fingerprint } = yield* api.credential(host, { repository: input.repository });
       const key = `${fingerprint}\0${host}\0${input.repository.toLowerCase()}\0${input.number}`;
       if (yield* Cache.has(refusedReviewers, key)) return yield* read(0);
       return yield* read(wanted).pipe(
@@ -1811,20 +1814,27 @@ export const make = Effect.gen(function* () {
 
   /** Preserve policy errors; map not-found per lookup and other failures to read errors. */
   const batchedRead = <A, E, R>(
-    input: { readonly cwd: string; readonly host: string; readonly operation: string },
+    input: {
+      readonly cwd: string;
+      readonly host: string;
+      readonly operation: string;
+      readonly repository?: string | undefined;
+    },
     effect: Effect.Effect<A, E, R>,
   ): Effect.Effect<
     A,
     | Exclude<E, GraphQLClientError.GraphQLClientError>
     | GitHubPullRequestReadError
-    | GitHubRequestPolicy.GitHubApiNotFoundError,
+    | GitHubRequestPolicy.GitHubApiError,
     Exclude<R, GitHubGraphQlClient.GitHubGraphQlTarget>
   > =>
     effect.pipe(
       Effect.provideService(GitHubGraphQlClient.GitHubGraphQlTarget, {
         host: input.host,
+        repository: input.repository,
         operation: input.operation,
       }),
+      GitHubRequestPolicy.withRepositoryCredential(api.credential, input),
       Effect.mapError((error) =>
         !isGraphQlClientError(error)
           ? (error as Exclude<E, GraphQLClientError.GraphQLClientError>)
@@ -1930,7 +1940,7 @@ export const make = Effect.gen(function* () {
           }),
         );
       }
-      const target = { cwd: input.cwd, host: input.host, operation: "listPullRequests" };
+      const target = { ...input, operation: "listPullRequests" };
       const toPage = (
         page: ReturnType<typeof toPullRequestRows>,
       ): GitHubPullRequestListPage & { readonly pageInfo: GraphQLClient.PageInfo } => ({
@@ -2053,7 +2063,7 @@ export const make = Effect.gen(function* () {
       // the credential that request carried. A personal credential is pinned for the whole
       // read, so a token changed mid-read does not split it; the app keeps the policy's fallback.
       const host = normalizeHost(input.host);
-      return api.credential(host).pipe(
+      return api.credential(host, { repository: input.repository }).pipe(
         Effect.flatMap(({ token, fingerprint, source }) =>
           source === undefined || source === "app"
             ? listed
@@ -2182,8 +2192,7 @@ export const make = Effect.gen(function* () {
         const { owner, name } = parseRepositorySelector(input.repository);
         // Read with every pull request detail, so revalidate it.
         return revalidatedRestRead({
-          cwd: input.cwd,
-          host: input.host,
+          ...input,
           operation: "listUnfinishedWorkflowRuns",
           path: `repos/${owner}/${name}/actions/runs?head_sha=${encodeURIComponent(input.headSha)}&per_page=100`,
           decode: decodeUnfinishedWorkflowRunsJson,
@@ -2195,8 +2204,7 @@ export const make = Effect.gen(function* () {
       const { owner, name } = parseRepositorySelector(input.repository);
       // Polled by the pull request sync for every linked pull request, so revalidate it.
       return revalidatedRestRead({
-        cwd: input.cwd,
-        host: input.host,
+        ...input,
         operation: "getPullRequestStack",
         path: `repos/${owner}/${name}/stacks?pull_request=${input.number}`,
         decode: decodePullRequestStacksJson,
@@ -2205,8 +2213,7 @@ export const make = Effect.gen(function* () {
         Effect.flatMap((stack) => {
           if (!input.includeDetails || stack === null) return Effect.succeed(stack);
           return restRead({
-            cwd: input.cwd,
-            host: input.host,
+            ...input,
             operation: "getPullRequestStack",
             path: `repos/${owner}/${name}/stacks/${stack.number}`,
             decode: (raw) => decodePullRequestStacksJson(`[${raw}]`),
