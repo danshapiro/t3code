@@ -592,15 +592,14 @@ export const layerWithOptions = (
                   reserveMcpCredential(threadId, existing.providerSessionId);
                   const rawToken = existing.authorizationHeader.replace(/^Bearer\s+/, "");
                   // Interrupted resolution must release the reservation before the caller learns of it.
-                  const resolved = yield* mcpSessionRegistry
-                    .resolve(rawToken)
-                    .pipe(
-                      Effect.onInterrupt(() =>
-                        Effect.sync(() =>
-                          dropMcpCredentialReservation(threadId, existing.providerSessionId),
-                        ),
+                  const resolved = yield* mcpSessionRegistry.touch(threadId).pipe(
+                    Effect.andThen(mcpSessionRegistry.resolve(rawToken)),
+                    Effect.onInterrupt(() =>
+                      Effect.sync(() =>
+                        dropMcpCredentialReservation(threadId, existing.providerSessionId),
                       ),
-                    );
+                    ),
+                  );
                   if (
                     resolved !== undefined &&
                     resolved.thread.threadId === threadId &&
@@ -1769,6 +1768,8 @@ export const layerWithOptions = (
           };
           // Lock attach through rollback so concurrent attaches cannot observe an attachment about to be undone.
           const attach = Effect.gen(function* () {
+            // Native loads initialize MCP before RunExecutionService starts the turn.
+            if (options.configureMcp !== false) yield* mcpSessionRegistry.touch(input.threadId);
             const attached = yield* attachThread(input).pipe(
               // Record without interruption so cleanup undoes only this call's attachment.
               Effect.tap((runtime) => Effect.sync(() => (attachedTo = runtime))),
