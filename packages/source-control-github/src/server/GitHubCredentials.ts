@@ -104,6 +104,7 @@ export class GitHubCredentials extends Context.Service<
   {
     readonly get: (
       host: string,
+      repository?: string,
     ) => Effect.Effect<GitHubCredential, GitHubCredentialUnavailableError>;
     /** The token saved in Settings for `host`, which outranks every other source. */
     readonly saved: (
@@ -284,19 +285,21 @@ export const make = Effect.gen(function* () {
   });
 
   return GitHubCredentials.of({
-    get: Effect.fn("GitHubCredentials.get")(function* (rawHost) {
+    get: Effect.fn("GitHubCredentials.get")(function* (rawHost, repository) {
       const host = normalizeHost(rawHost);
       const fromSettings = yield* saved(host);
       if (Option.isSome(fromSettings)) return fromSettings.value;
-      return yield* Cache.get(cache, cacheKey(host, (yield* hostChoice(host))?.account));
+      const owner = repository?.trim().split("/").filter(Boolean).at(-2)?.toLowerCase();
+      const account = (yield* hostChoice(host))?.account ?? owner;
+      return yield* Cache.get(cache, cacheKey(host, account));
     }),
     saved,
     fingerprint: fingerprintOf,
-    invalidate: Effect.fn("GitHubCredentials.invalidate")(function (rawHost) {
+    invalidate: Effect.fn("GitHubCredentials.invalidate")(function* (rawHost) {
       const host = normalizeHost(rawHost);
-      return hostChoice(host).pipe(
-        Effect.flatMap((choice) => Cache.invalidate(cache, cacheKey(host, choice?.account))),
-      );
+      for (const key of yield* Cache.keys(cache)) {
+        if (key === host || key.startsWith(`${host}\u0000`)) yield* Cache.invalidate(cache, key);
+      }
     }),
   });
 });

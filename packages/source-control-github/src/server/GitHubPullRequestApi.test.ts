@@ -127,6 +127,7 @@ const mockedCredential =
   vi.fn<
     (
       host: string,
+      options?: { readonly repository?: string | undefined },
     ) => Effect.Effect<GitHubRequestPolicy.GitHubHeldCredential, GitHubRequestPolicy.GitHubApiError>
   >(defaultCredential);
 const mockedStackMemberships = vi.fn<(call: ApiCall) => ApiAnswer>(() =>
@@ -137,7 +138,7 @@ const mockApi = Layer.succeed(
   GitHubRest.GitHubRest,
   GitHubRest.GitHubRest.of({
     rest: (input) => mockedExecute({ kind: "rest", ...input }),
-    credential: (host) => mockedCredential(host),
+    credential: (host, options) => mockedCredential(host, options),
     appCredential: () => Effect.succeedNone,
   }),
 );
@@ -209,8 +210,8 @@ const layer = it.layer(
     Layer.provideMerge(mockHttp),
     Layer.provideMerge(
       Layer.succeed(GitHubCredentials.GitHubCredentials, {
-        get: (host) =>
-          mockedCredential(host).pipe(
+        get: (host, repository) =>
+          mockedCredential(host, { repository }).pipe(
             Effect.map((held) => ({ source: "gh" as const, ...held, host })),
             Effect.mapError(() => new GitHubCredentials.GitHubCliMissingError({ host })),
           ),
@@ -746,6 +747,92 @@ it.effect(
 );
 
 layer("GitHubPullRequestApi.layer", (it) => {
+  it.effect(
+    "uses repository credentials for PR lists and separates concurrent summary batches",
+    () =>
+      Effect.gen(function* () {
+        mockedCredential.mockImplementation((host, options) => {
+          const owner = options?.repository?.split("/")[0] ?? "active";
+          return Effect.succeed({
+            token: Redacted.make(owner),
+            fingerprint: `${host}:${owner}`,
+            source: "gh",
+          });
+        });
+        mockedExecute.mockImplementation((call) => {
+          assert.strictEqual(call.kind, "graphql");
+          if (call.kind !== "graphql") return Effect.die("Expected GraphQL");
+          const owners = Object.entries(call.variables ?? {})
+            .filter(([key]) => key.endsWith("owner"))
+            .map(([, owner]) => owner);
+          for (const owner of owners) expect(call.authorization).toBe(`Bearer ${owner}`);
+          if (call.query.includes("PullRequestSearch")) {
+            expect(call.authorization).toBe("Bearer personal");
+            return Effect.succeed(
+              output(
+                encodeJson({
+                  data: {
+                    search: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+                  },
+                }),
+              ),
+            );
+          }
+          if (call.query.includes("PullRequestList")) {
+            return Effect.succeed(
+              output(
+                encodeJson({
+                  data: {
+                    repository: {
+                      pullRequests: {
+                        nodes: [],
+                        pageInfo: { hasNextPage: false, endCursor: null },
+                      },
+                    },
+                  },
+                }),
+              ),
+            );
+          }
+          const pullRequest = {
+            ...coreResponse().data.repository.pullRequest,
+            latestReviews: { nodes: [] },
+            stack: null,
+            stackEntry: null,
+          };
+          const data = Object.fromEntries(
+            Object.keys(call.variables ?? {})
+              .filter((key) => key.endsWith("owner"))
+              .map((key) => [key.replace(/owner$/, "repository"), { pullRequest }]),
+          );
+          return Effect.succeed(output(encodeJson({ data })));
+        });
+        const cli = yield* GitHubPullRequestApi.GitHubPullRequestApi;
+        const listed = yield* cli.listPullRequests({
+          cwd: "/repo",
+          host: "github.com",
+          repository: "personal/web",
+          state: "open",
+          involvement: "all",
+          viewer: "personal",
+          limit: 5,
+        });
+        expect(listed.items).toEqual([]);
+        const summaries = yield* Effect.forEach(
+          ["personal", "organization"],
+          (owner) => cli.getPullRequestSummary({ ...pullRequestInput, repository: `${owner}/web` }),
+          { concurrency: "unbounded" },
+        ).pipe(Effect.forkChild);
+        yield* TestClock.adjust("10 millis");
+        expect((yield* Fiber.join(summaries)).map((summary) => summary.number)).toEqual([7, 7]);
+        expect(
+          mockedExecute.mock.calls.filter(
+            ([call]) => call.kind === "graphql" && call.query.includes("_0_repository"),
+          ),
+        ).toHaveLength(2);
+      }),
+  );
+
   it.effect("keeps recent references when the typed number does not exist", () =>
     Effect.gen(function* () {
       const search = {

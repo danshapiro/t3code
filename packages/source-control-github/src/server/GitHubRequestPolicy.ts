@@ -201,6 +201,7 @@ export type GitHubAnswer<A> = {
 
 export interface GitHubRequest {
   readonly host: string;
+  readonly repository?: string | undefined;
   readonly operation: string;
   /** The quota the request spends: `core` for REST, `graphql` for GraphQL. */
   readonly resource: string;
@@ -230,7 +231,7 @@ export class GitHubRequestPolicy extends Context.Service<
      */
     readonly credential: (
       host: string,
-      options?: { readonly personal?: boolean },
+      options?: { readonly personal?: boolean; readonly repository?: string | undefined },
     ) => Effect.Effect<GitHubHeldCredential, GitHubApiError>;
     /** The app sign-in's own credential, whatever else outranks it; none when not signed in. */
     readonly appCredential: (
@@ -269,6 +270,30 @@ function refusedToApp<A>(answer: GitHubAnswer<A>): boolean {
   }
 }
 
+/** Keep a repository's personal credential stable before GraphQL computes its batch key. */
+export const withRepositoryCredential = (
+  credential: GitHubRequestPolicy["Service"]["credential"],
+  input: { readonly host: string; readonly repository?: string | undefined },
+) =>
+  Effect.fn("GitHubRequestPolicy.withRepositoryCredential")(function* <A, E, R>(
+    effect: Effect.Effect<A, E, R>,
+  ) {
+    if (input.repository === undefined || (yield* PinnedGitHubCredential) !== null)
+      return yield* effect;
+    const { token, fingerprint, source } = yield* credential(input.host, {
+      repository: input.repository,
+    });
+    if (source === undefined || source === "app") return yield* effect;
+    return yield* effect.pipe(
+      Effect.provideService(PinnedGitHubCredential, {
+        host: normalizeHost(input.host),
+        token,
+        credentialFingerprint: fingerprint,
+        source,
+      }),
+    );
+  });
+
 /** @public */
 export const make = Effect.gen(function* () {
   const credentials = yield* GitHubCredentials.GitHubCredentials;
@@ -277,8 +302,8 @@ export const make = Effect.gen(function* () {
   const limits = yield* SourceControlRateLimit.SourceControlRateLimit;
   const slots = yield* Semaphore.make(CONCURRENCY);
 
-  const personalCredential = (host: string) =>
-    credentials.get(host).pipe(
+  const personalCredential = (host: string, repository?: string) =>
+    credentials.get(host, repository).pipe(
       Effect.map((held): ChosenCredential => ({
         token: held.token,
         fingerprint: held.fingerprint,
@@ -299,7 +324,11 @@ export const make = Effect.gen(function* () {
     });
   });
 
-  const choose = Effect.fn("GitHubRest.credential")(function* (host: string, personal: boolean) {
+  const choose = Effect.fn("GitHubRest.credential")(function* (
+    host: string,
+    personal: boolean,
+    repository?: string,
+  ) {
     const pinned = yield* PinnedGitHubCredential;
     if (pinned !== null) {
       if (pinned.host !== host) {
@@ -321,18 +350,18 @@ export const make = Effect.gen(function* () {
         fromApp: false,
       };
     }
-    if (personal) return yield* personalCredential(host);
+    if (personal) return yield* personalCredential(host, repository);
     const app = yield* Effect.result(appCredential(host));
     // An app session that cannot refresh right now steps aside for the user's own credential.
     if (Result.isFailure(app)) {
-      return yield* personalCredential(host).pipe(Effect.mapError(() => app.failure));
+      return yield* personalCredential(host, repository).pipe(Effect.mapError(() => app.failure));
     }
-    if (Option.isNone(app.success)) return yield* personalCredential(host);
+    if (Option.isNone(app.success)) return yield* personalCredential(host, repository);
     return { ...app.success.value, fromApp: true } satisfies ChosenCredential;
   });
 
   const credential: GitHubRequestPolicy["Service"]["credential"] = (host, options) =>
-    choose(normalizeHost(host), options?.personal === true).pipe(
+    choose(normalizeHost(host), options?.personal === true, options?.repository).pipe(
       Effect.map(({ token, fingerprint, source }) => ({
         token,
         fingerprint,
@@ -438,7 +467,7 @@ export const make = Effect.gen(function* () {
               }),
             );
             if (held.fromApp && refusedToApp(answer)) {
-              const personal = yield* Effect.option(personalCredential(host));
+              const personal = yield* Effect.option(personalCredential(host, input.repository));
               if (Option.isSome(personal)) {
                 yield* quota.observe(host, answer.headers);
                 yield* limits.recordSuccess({ ...key, lease });
@@ -455,7 +484,7 @@ export const make = Effect.gen(function* () {
         );
 
     // Only an app credential is handed on, so this runs at most twice.
-    let held = yield* choose(host, false);
+    let held = yield* choose(host, false, input.repository);
     while (true) {
       const outcome = yield* attempt(held);
       if (outcome._tag === "Done") return outcome.value;

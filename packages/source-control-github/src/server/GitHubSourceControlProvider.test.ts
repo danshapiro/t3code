@@ -90,6 +90,7 @@ const node = (number: number, headRefName: string, owner = "acme") => ({
 
 interface GraphQlCall {
   readonly host: string;
+  readonly authorization: string | undefined;
   readonly operationName: string;
   readonly query: string;
   readonly lookups: ReadonlyArray<Readonly<Record<string, unknown>>>;
@@ -127,6 +128,7 @@ function graphQlHttp(respond: GraphQlRespond, calls: Array<GraphQlCall>) {
             );
       const call: GraphQlCall = {
         host: new URL(request.url).hostname.replace(/^api\./, ""),
+        authorization: request.headers["authorization"],
         operationName: sent.operationName,
         query: sent.query,
         lookups,
@@ -153,11 +155,12 @@ function graphQlHttp(respond: GraphQlRespond, calls: Array<GraphQlCall>) {
 }
 
 function harness(input: {
-  readonly remotes: string;
+  readonly remotes: string | ((cwd: string) => string);
   readonly api?: Partial<GitHubRest.GitHubRest["Service"]>;
   readonly graphql?: GraphQlRespond;
   readonly credential?: (
     host: string,
+    repository?: string,
   ) => Effect.Effect<
     GitHubCredentials.GitHubCredential,
     GitHubCredentials.GitHubCredentialUnavailableError
@@ -208,7 +211,9 @@ function harness(input: {
       run: (args) =>
         Effect.succeed(
           args.args[0] === "remote"
-            ? processOutput(input.remotes)
+            ? processOutput(
+                typeof input.remotes === "string" ? input.remotes : input.remotes(args.cwd),
+              )
             : processOutput(input.resolved ?? "", input.resolved ? 0 : 1),
         ),
     },
@@ -453,6 +458,53 @@ describe("GitHubSourceControlProvider repository resolution", () => {
 
 describe("GitHubSourceControlProvider change request lookups by head", () => {
   const remotes = remotesOutput(["origin", "git@github.com:acme/web.git"]);
+
+  it.effect("separates owner credentials in concurrent branch lookups and PR reads", () => {
+    const { layer, graphqlCalls } = harness({
+      remotes: (cwd) => remotesOutput(["origin", `git@github.com:${cwd.slice(1)}/web.git`]),
+      credential: (host, repository) =>
+        Effect.succeed({
+          host,
+          token: Redacted.make(repository?.split("/")[0] ?? "active"),
+          source: "gh" as const,
+          fingerprint: `${host}:${repository?.split("/")[0] ?? "active"}`,
+        }),
+      graphql: (lookup, call) => {
+        assert.strictEqual(call.authorization, `Bearer ${lookup.owner}`);
+        return lookup.number === undefined
+          ? { pullRequests: { nodes: [node(42, String(lookup.head))] } }
+          : { pullRequest: node(Number(lookup.number), "feature") };
+      },
+    });
+    return Effect.gen(function* () {
+      const gh = yield* GitHubSourceControlProvider.make;
+      const branches = yield* Effect.forEach(
+        ["personal", "organization"],
+        (owner) =>
+          gh.listChangeRequests({
+            cwd: `/${owner}`,
+            headSelector: "feature",
+            state: "open",
+            limit: 1,
+            context: {
+              ...githubContext("github.com"),
+              remoteUrl: `git@github.com:${owner}/web.git`,
+            },
+          }),
+        { concurrency: "unbounded" },
+      ).pipe(Effect.forkChild);
+      yield* TestClock.adjust("500 millis");
+      assert.deepStrictEqual(
+        (yield* Fiber.join(branches)).map((rows) => rows[0]?.number),
+        [42, 42],
+      );
+      yield* gh.getChangeRequest({
+        cwd: "/repo",
+        reference: "https://github.com/personal/web/pull/42",
+      });
+      assert.lengthOf(graphqlCalls, 3);
+    }).pipe(Effect.provide(layer));
+  });
 
   it.effect("filters an owner:branch selector by owner through REST", () => {
     const paths: string[] = [];

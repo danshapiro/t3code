@@ -106,10 +106,43 @@ describe("GitHubCredentials", () => {
     const { layer, calls } = harness({ "github.com": { account: "work" } });
     return Effect.gen(function* () {
       const credentials = yield* GitHubCredentials.GitHubCredentials;
-      const credential = yield* credentials.get("github.com");
+      const credential = yield* credentials.get("github.com", "personal/repo");
       expect(Redacted.value(credential.token)).toBe("from-env");
       expect(credential.source).toBe("env");
       expect(calls).toEqual([]);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("selects owner logins independently and falls back for unsigned-in owners", () => {
+    const { layer, calls } = harness({}, ["organization", "unknown"]);
+    return Effect.gen(function* () {
+      const credentials = yield* GitHubCredentials.GitHubCredentials;
+      const repositories = ["Personal/one", "work/two", "organization/three", "unknown/four"];
+      const read = (repository: string) => credentials.get("github.com", repository);
+      const selected = yield* Effect.forEach(repositories, read, { concurrency: "unbounded" });
+      expect(selected.map((credential) => Redacted.value(credential.token))).toEqual([
+        "token-for-personal",
+        "token-for-work",
+        "active-token",
+        "active-token",
+      ]);
+      expect(selected[0]?.fingerprint).not.toBe(selected[1]?.fingerprint);
+      for (const repository of repositories.toReversed()) yield* read(repository);
+      expect(calls).toHaveLength(6);
+      yield* credentials.invalidate("github.com");
+      yield* read("personal/one");
+      expect(calls).toHaveLength(7);
+      expect(Redacted.value((yield* credentials.get("github.com")).token)).toBe("active-token");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("keeps an explicit account ahead of the repository owner", () => {
+    const { layer } = harness({ "github.com": { account: "chosen" } });
+    return Effect.gen(function* () {
+      const credentials = yield* GitHubCredentials.GitHubCredentials;
+      expect(Redacted.value((yield* credentials.get("github.com", "personal/repo")).token)).toBe(
+        "token-for-chosen",
+      );
     }).pipe(Effect.provide(layer));
   });
 
@@ -158,7 +191,7 @@ describe("GitHubCredentials", () => {
     return Effect.gen(function* () {
       const credentials = yield* GitHubCredentials.GitHubCredentials;
       const settings = yield* TestSourceControlHost.TestSourceControlHostSettings;
-      const credential = yield* credentials.get("github.com");
+      const credential = yield* credentials.get("github.com", "personal/repo");
       expect(Redacted.value(credential.token)).toBe("saved-token");
       expect(credential.source).toBe("settings");
 

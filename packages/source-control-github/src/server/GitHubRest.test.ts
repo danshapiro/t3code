@@ -42,7 +42,10 @@ const appSignedOut = Layer.mock(GitHubAppSignIn.GitHubAppSignIn)({
 
 const NOW = Date.parse("2026-10-05T12:00:00.000Z");
 
-function harness(respond: (request: HttpClientRequest.HttpClientRequest) => Response) {
+function harness(
+  respond: (request: HttpClientRequest.HttpClientRequest) => Response,
+  byOwner = false,
+) {
   const requests: Array<HttpClientRequest.HttpClientRequest> = [];
   let tokens = ["first", "second"];
   let invalidations = 0;
@@ -50,14 +53,15 @@ function harness(respond: (request: HttpClientRequest.HttpClientRequest) => Resp
   const credentials = Layer.succeed(
     GitHubCredentials.GitHubCredentials,
     GitHubCredentials.GitHubCredentials.of({
-      get: (host) =>
+      get: (host, repository) =>
         Effect.sync(() => {
           credentialReads++;
+          const token = byOwner ? (repository?.split("/")[0] ?? "active") : tokens[0]!;
           return {
             host,
-            token: Redacted.make(tokens[0]!),
+            token: Redacted.make(token),
             source: "gh" as const,
-            fingerprint: `${host}:${tokens[0]}`,
+            fingerprint: `${host}:${token}`,
           };
         }),
       saved: () => Effect.succeedNone,
@@ -114,6 +118,21 @@ describe("environmentToken", () => {
 });
 
 describe("GitHubRest", () => {
+  it.effect("uses each REST repository owner without changing host-wide reads", () => {
+    const { layer, requests } = harness(() => json({}), true);
+    return Effect.gen(function* () {
+      const api = yield* GitHubRest.GitHubRest;
+      for (const path of ["repos/personal/web/pulls", "repos/organization/work/issues", "user"]) {
+        yield* api.rest({ host: "github.com", operation: "read", path });
+      }
+      expect(requests.map((request) => request.headers["authorization"])).toEqual([
+        "Bearer personal",
+        "Bearer organization",
+        "Bearer active",
+      ]);
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect("acknowledges workflow approval without waiting for an unused body", () => {
     const { layer } = harness(
       () =>
