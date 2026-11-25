@@ -487,6 +487,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     readonly startTurn?: Effect.Effect<void, ProviderAdapter.ProviderAdapterProtocolError>;
     readonly interruptTurn?: Effect.Effect<void>;
     readonly beforeUnload?: Effect.Effect<void>;
+    readonly beforeResume?: Effect.Effect<void>;
     readonly unloads?: Queue.Queue<string>;
     readonly archive?: Effect.Effect<void, ProviderAdapter.ProviderAdapterProtocolError>;
     readonly spawnBeforeOpen?: boolean;
@@ -603,10 +604,15 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
               }),
           ensureThread: () => unimplemented("ensureThread unused in test"),
           resumeThread: (threadInput) =>
-            Ref.update(state, (current) => ({
-              ...current,
-              resumeCount: current.resumeCount + 1,
-            })).pipe(Effect.as(threadInput.providerThread)),
+            (options.beforeResume ?? Effect.void).pipe(
+              Effect.andThen(
+                Ref.update(state, (current) => ({
+                  ...current,
+                  resumeCount: current.resumeCount + 1,
+                })),
+              ),
+              Effect.as(threadInput.providerThread),
+            ),
           startTurn: () => options.startTurn ?? Effect.void,
           steerTurn: () => Effect.void,
           interruptTurn: () =>
@@ -675,6 +681,8 @@ function layerTest(input: {
   readonly startTurn?: Effect.Effect<void, ProviderAdapter.ProviderAdapterProtocolError>;
   readonly interruptTurn?: Effect.Effect<void>;
   readonly beforeUnload?: Effect.Effect<void>;
+  readonly beforeResume?: Effect.Effect<void>;
+  readonly mcpLivenessWindowMs?: number;
   readonly unloads?: Queue.Queue<string>;
   readonly archive?: Effect.Effect<void, ProviderAdapter.ProviderAdapterProtocolError>;
   readonly spawnBeforeOpen?: boolean;
@@ -727,6 +735,7 @@ function layerTest(input: {
       ...(input.startTurn === undefined ? {} : { startTurn: input.startTurn }),
       ...(input.interruptTurn === undefined ? {} : { interruptTurn: input.interruptTurn }),
       ...(input.beforeUnload === undefined ? {} : { beforeUnload: input.beforeUnload }),
+      ...(input.beforeResume === undefined ? {} : { beforeResume: input.beforeResume }),
       ...(input.unloads === undefined ? {} : { unloads: input.unloads }),
       ...(input.archive === undefined ? {} : { archive: input.archive }),
       ...(input.spawnBeforeOpen === undefined ? {} : { spawnBeforeOpen: input.spawnBeforeOpen }),
@@ -739,9 +748,11 @@ function layerTest(input: {
     }).pipe(Effect.map(ProviderAdapterRegistry.layerSingle)),
   );
   const layerConfiguredMcpRegistry =
-    input.pauseResolve === undefined
-      ? layerTestMcpRegistry
-      : layerPausingMcpRegistry(input.pauseResolve);
+    input.mcpLivenessWindowMs !== undefined
+      ? layerMcpRegistry({ livenessWindowMs: input.mcpLivenessWindowMs })
+      : input.pauseResolve === undefined
+        ? layerTestMcpRegistry
+        : layerPausingMcpRegistry(input.pauseResolve);
   const layerProviderEventIngestorTest = ProviderEventIngestor.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
@@ -798,14 +809,17 @@ const fakeEnvironment = ServerEnvironment.ServerEnvironment.of({
   getDescriptor: Effect.die("unused"),
 });
 
-const layerTestMcpRegistry = Layer.effect(
-  McpSessionRegistry.McpSessionRegistry,
-  McpSessionRegistry.__testing.make(),
-).pipe(
-  Layer.provide(Layer.succeed(HttpServer.HttpServer, fakeHttpServer)),
-  Layer.provide(Layer.succeed(ServerEnvironment.ServerEnvironment, fakeEnvironment)),
-  Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
-);
+const layerMcpRegistry = (options: McpSessionRegistry.McpSessionRegistryOptions = {}) =>
+  Layer.effect(
+    McpSessionRegistry.McpSessionRegistry,
+    McpSessionRegistry.__testing.make(options),
+  ).pipe(
+    Layer.provide(Layer.succeed(HttpServer.HttpServer, fakeHttpServer)),
+    Layer.provide(Layer.succeed(ServerEnvironment.ServerEnvironment, fakeEnvironment)),
+    Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+  );
+
+const layerTestMcpRegistry = layerMcpRegistry();
 
 const layerPausingMcpRegistry = (pause: {
   readonly armed: Ref.Ref<boolean>;
@@ -3157,6 +3171,129 @@ it.effect(
             state,
             idleTimeoutMs: 1_000,
             mcpConfigs,
+          }),
+        ),
+      );
+    }),
+);
+
+it.effect.each([
+  { kind: "root", relationshipToParent: null },
+  { kind: "child", relationshipToParent: "subagent" },
+] as const)(
+  "ProviderSessionManagerV2 refreshes idle MCP credentials before native loads ($kind)",
+  ({ relationshipToParent }) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      let authenticateOnResume = Effect.void;
+      yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const registry = yield* McpSessionRegistry.McpSessionRegistry;
+        const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make(`mcp-idle-${relationshipToParent}`);
+        const otherThreadId = ThreadId.make("mcp-idle-other");
+        const created = yield* makeThreadCreatedEvent({ idAllocator, threadId, now });
+        yield* eventSink.write({
+          events: [
+            {
+              ...created,
+              payload: {
+                ...created.payload,
+                lineage:
+                  relationshipToParent === null
+                    ? created.payload.lineage
+                    : {
+                        parentThreadId: otherThreadId,
+                        rootThreadId: otherThreadId,
+                        relationshipToParent,
+                      },
+              },
+            },
+          ],
+        });
+        const other = yield* registry.issue({
+          threadId: otherThreadId,
+          providerInstanceId: modelSelection.instanceId,
+        });
+        const otherToken = other.config.authorizationHeader.replace(/^Bearer\s+/, "");
+        const providerSessionId = idAllocator.derive.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+        });
+        const open = manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+        const runtime = yield* open;
+        const original = (yield* mcpSessions.read(threadId))!;
+        const originalToken = original.authorizationHeader.replace(/^Bearer\s+/, "");
+        const originalScope = yield* registry.resolve(originalToken);
+        assert.equal(originalScope?.thread.subagent, relationshipToParent === "subagent");
+        const providerThread = makeProviderThread({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          now,
+        });
+        authenticateOnResume = Effect.gen(function* () {
+          const config = (yield* mcpSessions.read(threadId))!;
+          assert.isDefined(
+            yield* registry.resolve(config.authorizationHeader.replace(/^Bearer\s+/, "")),
+            "native MCP initialization must authenticate before the provider turn starts",
+          );
+        });
+
+        const resume = runtime.resumeThread({
+          providerThread,
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* resume;
+        yield* manager.forgetLoadedProviderThread({
+          providerSessionId,
+          threadId,
+          providerThread,
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* TestClock.adjust(101);
+        assert.isUndefined(yield* registry.resolve(originalToken));
+        yield* resume;
+        assert.deepEqual(yield* registry.resolve(originalToken), originalScope);
+        assert.isUndefined(yield* registry.resolve(otherToken));
+
+        yield* manager.detach({ providerSessionId, threadId, detail: "Workspace changed." });
+        yield* TestClock.adjust(101);
+        assert.isUndefined(yield* registry.resolve(originalToken));
+        yield* open;
+        yield* resume;
+        assert.equal(
+          (yield* mcpSessions.read(threadId))?.providerSessionId,
+          original.providerSessionId,
+        );
+        assert.deepEqual(yield* registry.resolve(originalToken), originalScope);
+        assert.isUndefined(yield* registry.resolve(otherToken));
+
+        yield* manager.close(providerSessionId);
+        assert.isUndefined(yield* registry.resolve(originalToken));
+        const replacement = yield* open;
+        const current = (yield* mcpSessions.read(threadId))!;
+        assert.notEqual(current.providerSessionId, original.providerSessionId);
+        yield* replacement.resumeThread({
+          providerThread,
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        assert.isUndefined(yield* registry.resolve(originalToken));
+        yield* manager.close(providerSessionId);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 1_000,
+            mcpLivenessWindowMs: 100,
+            beforeResume: Effect.suspend(() => authenticateOnResume),
           }),
         ),
       );
